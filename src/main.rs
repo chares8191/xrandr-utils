@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
@@ -29,15 +30,29 @@ fn run() -> Result<(), String> {
     let sections = parse_sections(&verbose);
 
     match command.as_str() {
-        "display_state" => {
+        "display_connected" => {
             let display = expect_arg(&mut args, "display")?;
             let section = find_section(&sections, &display)
                 .ok_or_else(|| format!("display not found: {display}"))?;
             println!("{}", section.state.as_str());
         }
-        "display_state_map" => {
+        "single_display_output" => {
+            let keep = expect_arg(&mut args, "display")?;
+            run_single_display_output(&keep, &sections)?;
+        }
+        "dual_display_output" => {
+            let left = expect_arg(&mut args, "left display")?;
+            let right = expect_arg(&mut args, "right display")?;
+            run_dual_display_output(&left, &right, &sections)?;
+        }
+        "display_connected_map" => {
+            let flags = parse_map_flags(&mut args, false)?;
             for section in &sections {
-                println!("{}={}", section.name, section.state.as_str());
+                let value = section.state.as_str();
+                if should_skip_map_value(value, &flags) {
+                    continue;
+                }
+                println!("{}={}", section.name, value);
             }
         }
         "display_section" => {
@@ -51,9 +66,13 @@ fn run() -> Result<(), String> {
             println!("{text}");
         }
         "display_section_map" => {
+            let flags = parse_map_flags(&mut args, false)?;
             for section in &sections {
                 let text = section.lines.join("\n");
                 let escaped = escape_multiline(&text);
+                if should_skip_map_value(&escaped, &flags) {
+                    continue;
+                }
                 println!("{}={}", section.name, escaped);
             }
         }
@@ -92,6 +111,7 @@ fn run() -> Result<(), String> {
             println!("{serial}");
         }
         "display_serial_map" => {
+            let flags = parse_map_flags(&mut args, false)?;
             for section in &sections {
                 let serial = match extract_edid_hex(section) {
                     Some(edid) => match decode_edid(&edid) {
@@ -100,19 +120,19 @@ fn run() -> Result<(), String> {
                     },
                     None => String::new(),
                 };
+                if should_skip_map_value(serial.as_str(), &flags) {
+                    continue;
+                }
                 println!("{}={}", section.name, serial);
             }
         }
         "display_names" => {
+            let connected_only = parse_display_names_flags(&mut args)?;
             for section in &sections {
-                println!("{}", section.name);
-            }
-        }
-        "connected_display_names" => {
-            for section in &sections {
-                if section.state == DisplayState::Connected {
-                    println!("{}", section.name);
+                if connected_only && section.state != DisplayState::Connected {
+                    continue;
                 }
+                println!("{}", section.name);
             }
         }
         "display_geometry" => {
@@ -128,17 +148,40 @@ fn run() -> Result<(), String> {
             println!("{geometry}");
         }
         "display_geometry_map" => {
+            let flags = parse_map_flags(&mut args, false)?;
             for section in &sections {
                 if section.state != DisplayState::Connected {
                     continue;
                 }
                 if let Some(geometry) = &section.geometry {
-                    if section.primary {
-                        println!("{}=primary,{}", section.name, geometry);
+                    let value = if section.primary {
+                        format!("primary,{}", geometry)
                     } else {
-                        println!("{}={}", section.name, geometry);
+                        geometry.clone()
+                    };
+                    if should_skip_map_value(value.as_str(), &flags) {
+                        continue;
                     }
+                    println!("{}={}", section.name, value);
                 }
+            }
+        }
+        "display_connector" => {
+            let display = expect_arg(&mut args, "display")?;
+            let section = find_section(&sections, &display)
+                .ok_or_else(|| format!("display not found: {display}"))?;
+            let connector = extract_connector_id(section)
+                .ok_or_else(|| format!("connector id not available for: {display}"))?;
+            println!("{connector}");
+        }
+        "display_connector_map" => {
+            let flags = parse_map_flags(&mut args, false)?;
+            for section in &sections {
+                let connector = extract_connector_id(section).unwrap_or_default();
+                if should_skip_map_value(connector.as_str(), &flags) {
+                    continue;
+                }
+                println!("{}={}", section.name, connector);
             }
         }
         "display_label_line" => {
@@ -152,6 +195,92 @@ fn run() -> Result<(), String> {
             }
         }
         _ => return Err(format!("unknown command: {command}")),
+    }
+
+    Ok(())
+}
+
+fn run_single_display_output(keep: &str, sections: &[DisplaySection]) -> Result<(), String> {
+    if find_section(sections, keep).is_none() {
+        return Err(format!("display not found: {keep}"));
+    }
+
+    let mut exclude = HashSet::new();
+    exclude.insert(keep.to_string());
+
+    let off_targets = filtered_display_names(sections, &exclude);
+    let mut args = vec![
+        "--output".to_string(),
+        keep.to_string(),
+        "--primary".to_string(),
+        "--auto".to_string(),
+    ];
+    args.extend(build_off_args(&off_targets));
+
+    run_xrandr_with_args(args)
+}
+
+fn run_dual_display_output(left: &str, right: &str, sections: &[DisplaySection]) -> Result<(), String> {
+    if left == right {
+        return Err("left and right displays must be different".to_string());
+    }
+
+    if find_section(sections, left).is_none() {
+        return Err(format!("display not found: {left}"));
+    }
+    if find_section(sections, right).is_none() {
+        return Err(format!("display not found: {right}"));
+    }
+
+    let mut exclude = HashSet::new();
+    exclude.insert(left.to_string());
+    exclude.insert(right.to_string());
+
+    let off_targets = filtered_display_names(sections, &exclude);
+
+    let mut args = vec![
+        "--output".to_string(),
+        left.to_string(),
+        "--primary".to_string(),
+        "--auto".to_string(),
+        "--output".to_string(),
+        right.to_string(),
+        "--auto".to_string(),
+        "--right-of".to_string(),
+        left.to_string(),
+    ];
+    args.extend(build_off_args(&off_targets));
+
+    run_xrandr_with_args(args)
+}
+
+fn filtered_display_names(sections: &[DisplaySection], exclude: &HashSet<String>) -> Vec<String> {
+    sections
+        .iter()
+        .map(|section| section.name.as_str())
+        .filter(|name| !exclude.contains(*name))
+        .map(|name| name.to_string())
+        .collect()
+}
+
+fn build_off_args(displays: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    for display in displays {
+        args.push("--output".to_string());
+        args.push(display.clone());
+        args.push("--off".to_string());
+    }
+    args
+}
+
+fn run_xrandr_with_args(args: Vec<String>) -> Result<(), String> {
+    let status = Command::new("xrandr")
+        .args(&args)
+        .status()
+        .map_err(|err| format!("failed to run xrandr: {err}"))?;
+
+    if !status.success() {
+        return Err(format!("xrandr command failed: {status}"));
     }
 
     Ok(())
@@ -236,6 +365,45 @@ fn parse_sections(verbose: &str) -> Vec<DisplaySection> {
     }
 
     sections
+}
+
+#[derive(Default)]
+struct MapFlags {
+    filtered: bool,
+}
+
+fn parse_display_names_flags(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<bool, String> {
+    let mut connected_only = false;
+    for arg in args {
+        match arg.as_str() {
+            "--connected" => connected_only = true,
+            _ => return Err(format!("unknown option: {arg}")),
+        }
+    }
+    Ok(connected_only)
+}
+
+fn parse_map_flags(
+    args: &mut impl Iterator<Item = String>,
+    _allow_transposed: bool,
+) -> Result<MapFlags, String> {
+    let mut flags = MapFlags::default();
+    for arg in args {
+        match arg.as_str() {
+            "--filtered" => flags.filtered = true,
+            _ => return Err(format!("unknown option: {arg}")),
+        }
+    }
+    Ok(flags)
+}
+
+fn should_skip_map_value(value: &str, flags: &MapFlags) -> bool {
+    if !flags.filtered {
+        return false;
+    }
+    value.trim().is_empty()
 }
 
 struct HeaderInfo {
@@ -384,6 +552,19 @@ fn extract_edid_hex(section: &DisplaySection) -> Option<String> {
     }
 }
 
+fn extract_connector_id(section: &DisplaySection) -> Option<String> {
+    for line in &section.lines {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("CONNECTOR_ID:") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn decode_edid(hex: &str) -> Result<String, String> {
     let bytes = hex_to_bytes(hex)?;
     let mut child = Command::new("edid-decode")
@@ -489,18 +670,21 @@ fn print_usage() {
     println!(
         "Usage: xrandr-utils <command> [args]\n\n\
 Commands:\n  \
-display_state <display>\n  \
-display_state_map\n  \
+display_connected <display>\n  \
+display_connected_map [--filtered]\n  \
 display_section <display>\n  \
-display_section_map\n  \
+display_section_map [--filtered]\n  \
 display_edid <display>\n  \
 display_edid_decoded <display>\n  \
 display_serial <display>\n  \
-display_serial_map\n  \
-display_names\n  \
-connected_display_names\n  \
+display_serial_map [--filtered]\n  \
+display_connector <display>\n  \
+display_connector_map [--filtered]\n  \
+display_names [--connected]\n  \
 display_geometry <display>\n  \
-display_geometry_map\n  \
-display_label_line <display>\n"
+display_geometry_map [--filtered]\n  \
+display_label_line <display>\n  \
+single_display_output <display>\n  \
+dual_display_output <left> <right>\n"
     );
 }
