@@ -1,7 +1,4 @@
-# Contributing
-
-Thanks for helping improve `xrandr-utils`! A few expectations keep the workflow smooth:
-
+# Codex Notes
 - Run `cargo fmt` and `cargo check` before sending patches.
 - Build in release mode with `cargo build --release`.
 - After any change that touches the CLI, reinstall the binary locally with  
