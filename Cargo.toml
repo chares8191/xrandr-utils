@@ -1,0 +1,8 @@
+[package]
+name = "xrandr-utils"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "xrandr-utils"
+path = "src/main.rs"
