@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
@@ -28,6 +28,7 @@ fn run() -> Result<(), String> {
 
     let verbose = get_verbose_text()?;
     let sections = parse_sections(&verbose);
+    let mut args = args.peekable();
 
     match command.as_str() {
         "display_connected" => {
@@ -47,12 +48,10 @@ fn run() -> Result<(), String> {
         }
         "display_connected_map" => {
             let flags = parse_map_flags(&mut args, false)?;
+            let mut seen_values = HashSet::new();
             for section in &sections {
                 let value = section.state.as_str();
-                if should_skip_map_value(value, &flags) {
-                    continue;
-                }
-                println!("{}={}", section.name, value);
+                output_map_entry(&section.name, value, &flags, &mut seen_values);
             }
         }
         "display_section" => {
@@ -67,31 +66,27 @@ fn run() -> Result<(), String> {
         }
         "display_section_map" => {
             let flags = parse_map_flags(&mut args, false)?;
+            let mut seen_values = HashSet::new();
             for section in &sections {
                 let text = section.lines.join("\n");
                 let escaped = escape_multiline(&text);
-                if should_skip_map_value(&escaped, &flags) {
-                    continue;
-                }
-                println!("{}={}", section.name, escaped);
+                output_map_entry(&section.name, &escaped, &flags, &mut seen_values);
             }
         }
         "display_edid" => {
             let display = expect_arg(&mut args, "display")?;
             let section = find_section(&sections, &display)
                 .ok_or_else(|| format!("display not found: {display}"))?;
-            let edid = extract_edid_hex(section).ok_or_else(|| {
-                format!("edid data not available for display: {display}")
-            })?;
+            let edid = extract_edid_hex(section)
+                .ok_or_else(|| format!("edid data not available for display: {display}"))?;
             println!("{edid}");
         }
         "display_edid_decoded" => {
             let display = expect_arg(&mut args, "display")?;
             let section = find_section(&sections, &display)
                 .ok_or_else(|| format!("display not found: {display}"))?;
-            let edid = extract_edid_hex(section).ok_or_else(|| {
-                format!("edid data not available for display: {display}")
-            })?;
+            let edid = extract_edid_hex(section)
+                .ok_or_else(|| format!("edid data not available for display: {display}"))?;
             let decoded = decode_edid(&edid)?;
             print!("{decoded}");
             if !decoded.ends_with('\n') {
@@ -102,9 +97,8 @@ fn run() -> Result<(), String> {
             let display = expect_arg(&mut args, "display")?;
             let section = find_section(&sections, &display)
                 .ok_or_else(|| format!("display not found: {display}"))?;
-            let edid = extract_edid_hex(section).ok_or_else(|| {
-                format!("edid data not available for display: {display}")
-            })?;
+            let edid = extract_edid_hex(section)
+                .ok_or_else(|| format!("edid data not available for display: {display}"))?;
             let decoded = decode_edid(&edid)?;
             let serial = extract_serial(&decoded)
                 .ok_or_else(|| format!("serial not found in edid for: {display}"))?;
@@ -112,6 +106,7 @@ fn run() -> Result<(), String> {
         }
         "display_serial_map" => {
             let flags = parse_map_flags(&mut args, false)?;
+            let mut seen_values = HashSet::new();
             for section in &sections {
                 let serial = match extract_edid_hex(section) {
                     Some(edid) => match decode_edid(&edid) {
@@ -120,10 +115,7 @@ fn run() -> Result<(), String> {
                     },
                     None => String::new(),
                 };
-                if should_skip_map_value(serial.as_str(), &flags) {
-                    continue;
-                }
-                println!("{}={}", section.name, serial);
+                output_map_entry(&section.name, serial.as_str(), &flags, &mut seen_values);
             }
         }
         "display_names" => {
@@ -142,13 +134,15 @@ fn run() -> Result<(), String> {
             if section.state != DisplayState::Connected {
                 return Err(format!("display not connected: {display}"));
             }
-            let geometry = section.geometry.clone().ok_or_else(|| {
-                format!("geometry not available for display: {display}")
-            })?;
+            let geometry = section
+                .geometry
+                .clone()
+                .ok_or_else(|| format!("geometry not available for display: {display}"))?;
             println!("{geometry}");
         }
         "display_geometry_map" => {
             let flags = parse_map_flags(&mut args, false)?;
+            let mut seen_values = HashSet::new();
             for section in &sections {
                 if section.state != DisplayState::Connected {
                     continue;
@@ -159,10 +153,7 @@ fn run() -> Result<(), String> {
                     } else {
                         geometry.clone()
                     };
-                    if should_skip_map_value(value.as_str(), &flags) {
-                        continue;
-                    }
-                    println!("{}={}", section.name, value);
+                    output_map_entry(&section.name, value.as_str(), &flags, &mut seen_values);
                 }
             }
         }
@@ -176,12 +167,31 @@ fn run() -> Result<(), String> {
         }
         "display_connector_map" => {
             let flags = parse_map_flags(&mut args, false)?;
+            let mut seen_values = HashSet::new();
             for section in &sections {
                 let connector = extract_connector_id(section).unwrap_or_default();
-                if should_skip_map_value(connector.as_str(), &flags) {
-                    continue;
-                }
-                println!("{}={}", section.name, connector);
+                output_map_entry(&section.name, connector.as_str(), &flags, &mut seen_values);
+            }
+        }
+        "display_monitor" => {
+            let display = expect_arg(&mut args, "display")?;
+            let monitors_input = args.next();
+            let monitor_text = resolve_monitors_text(monitors_input)?;
+            let monitor_map = parse_monitor_map(&monitor_text);
+            let line = monitor_map
+                .get(&display)
+                .ok_or_else(|| format!("monitor entry not found for display: {display}"))?;
+            println!("{}", line);
+        }
+        "display_monitor_map" => {
+            let flags = parse_map_flags(&mut args, false)?;
+            let monitors_input = args.next();
+            let monitor_text = resolve_monitors_text(monitors_input)?;
+            let monitor_map = parse_monitor_map(&monitor_text);
+            let mut seen_values = HashSet::new();
+            for section in &sections {
+                let value = monitor_map.get(&section.name).cloned().unwrap_or_default();
+                output_map_entry(&section.name, &value, &flags, &mut seen_values);
             }
         }
         "display_label_line" => {
@@ -220,7 +230,11 @@ fn run_single_display_output(keep: &str, sections: &[DisplaySection]) -> Result<
     run_xrandr_with_args(args)
 }
 
-fn run_dual_display_output(left: &str, right: &str, sections: &[DisplaySection]) -> Result<(), String> {
+fn run_dual_display_output(
+    left: &str,
+    right: &str,
+    sections: &[DisplaySection],
+) -> Result<(), String> {
     if left == right {
         return Err("left and right displays must be different".to_string());
     }
@@ -370,11 +384,11 @@ fn parse_sections(verbose: &str) -> Vec<DisplaySection> {
 #[derive(Default)]
 struct MapFlags {
     filtered: bool,
+    keys: bool,
+    values: bool,
 }
 
-fn parse_display_names_flags(
-    args: &mut impl Iterator<Item = String>,
-) -> Result<bool, String> {
+fn parse_display_names_flags(args: &mut impl Iterator<Item = String>) -> Result<bool, String> {
     let mut connected_only = false;
     for arg in args {
         match arg.as_str() {
@@ -385,14 +399,33 @@ fn parse_display_names_flags(
     Ok(connected_only)
 }
 
-fn parse_map_flags(
-    args: &mut impl Iterator<Item = String>,
+fn parse_map_flags<I>(
+    args: &mut std::iter::Peekable<I>,
     _allow_transposed: bool,
-) -> Result<MapFlags, String> {
+) -> Result<MapFlags, String>
+where
+    I: Iterator<Item = String>,
+{
     let mut flags = MapFlags::default();
-    for arg in args {
+    while let Some(arg) = args.peek() {
+        if !arg.starts_with("--") {
+            break;
+        }
+        let arg = args.next().expect("peeked value must exist");
         match arg.as_str() {
             "--filtered" => flags.filtered = true,
+            "--keys" => {
+                if flags.values {
+                    return Err("cannot combine --keys with --values".to_string());
+                }
+                flags.keys = true;
+            }
+            "--values" => {
+                if flags.keys {
+                    return Err("cannot combine --keys with --values".to_string());
+                }
+                flags.values = true;
+            }
             _ => return Err(format!("unknown option: {arg}")),
         }
     }
@@ -400,10 +433,26 @@ fn parse_map_flags(
 }
 
 fn should_skip_map_value(value: &str, flags: &MapFlags) -> bool {
-    if !flags.filtered {
+    if !(flags.filtered || flags.values) {
         return false;
     }
     value.trim().is_empty()
+}
+
+fn output_map_entry(name: &str, value: &str, flags: &MapFlags, seen_values: &mut HashSet<String>) {
+    if should_skip_map_value(value, flags) {
+        return;
+    }
+
+    if flags.keys {
+        println!("{name}");
+    } else if flags.values {
+        if seen_values.insert(value.to_string()) {
+            println!("{value}");
+        }
+    } else {
+        println!("{name}={value}");
+    }
 }
 
 struct HeaderInfo {
@@ -565,6 +614,60 @@ fn extract_connector_id(section: &DisplaySection) -> Option<String> {
     None
 }
 
+fn resolve_monitors_text(provided: Option<String>) -> Result<String, String> {
+    if let Some(text) = provided {
+        if text.trim().is_empty() {
+            return Err("monitor text argument is empty".to_string());
+        }
+        return Ok(text);
+    }
+
+    let output = Command::new("xrandr")
+        .arg("--listmonitors")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|err| format!("failed to run xrandr --listmonitors: {err}"))?;
+
+    if !output.status.success() {
+        return Err("xrandr --listmonitors exited with failure".to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn parse_monitor_map(text: &str) -> HashMap<String, String> {
+    let mut lines = text.lines();
+    let mut map = HashMap::new();
+
+    if let Some(first) = lines.next() {
+        if !first.starts_with("Monitors:") {
+            insert_monitor_line(&mut map, first);
+        }
+        for line in lines {
+            insert_monitor_line(&mut map, line);
+        }
+    }
+
+    map
+}
+
+fn insert_monitor_line(map: &mut HashMap<String, String>, line: &str) {
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let index_part = match parts.next() {
+        Some(value) => value,
+        None => return,
+    };
+    if let Some(name) = parts.last() {
+        let index_value = index_part.split(':').next().unwrap_or(index_part);
+        map.insert(name.to_string(), index_value.to_string());
+    }
+}
+
 fn decode_edid(hex: &str) -> Result<String, String> {
     let bytes = hex_to_bytes(hex)?;
     let mut child = Command::new("edid-decode")
@@ -605,8 +708,8 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     while index < chars.len() {
         let hi = chars[index];
         let lo = chars[index + 1];
-        let value = hex_pair_to_byte(hi, lo)
-            .ok_or_else(|| format!("invalid hex pair: {hi}{lo}"))?;
+        let value =
+            hex_pair_to_byte(hi, lo).ok_or_else(|| format!("invalid hex pair: {hi}{lo}"))?;
         bytes.push(value);
         index += 2;
     }
@@ -671,18 +774,20 @@ fn print_usage() {
         "Usage: xrandr-utils <command> [args]\n\n\
 Commands:\n  \
 display_connected <display>\n  \
-display_connected_map [--filtered]\n  \
+display_connected_map [--filtered] [--keys] [--values]\n  \
 display_section <display>\n  \
-display_section_map [--filtered]\n  \
+display_section_map [--filtered] [--keys] [--values]\n  \
 display_edid <display>\n  \
 display_edid_decoded <display>\n  \
 display_serial <display>\n  \
-display_serial_map [--filtered]\n  \
+display_serial_map [--filtered] [--keys] [--values]\n  \
 display_connector <display>\n  \
-display_connector_map [--filtered]\n  \
+display_connector_map [--filtered] [--keys] [--values]\n  \
+display_monitor <display>\n  \
+display_monitor_map [--filtered] [--keys] [--values]\n  \
 display_names [--connected]\n  \
 display_geometry <display>\n  \
-display_geometry_map [--filtered]\n  \
+display_geometry_map [--filtered] [--keys] [--values]\n  \
 display_label_line <display>\n  \
 single_display_output <display>\n  \
 dual_display_output <left> <right>\n"
