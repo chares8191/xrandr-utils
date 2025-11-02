@@ -108,14 +108,20 @@ fn run() -> Result<(), String> {
             let flags = parse_map_flags(&mut args, false)?;
             let mut seen_values = HashSet::new();
             for section in &sections {
-                let serial = match extract_edid_hex(section) {
-                    Some(edid) => match decode_edid(&edid) {
-                        Ok(decoded) => extract_serial(&decoded).unwrap_or_default(),
-                        Err(_) => String::new(),
-                    },
-                    None => String::new(),
-                };
+                let serial = section_serial(section).unwrap_or_default();
                 output_map_entry(&section.name, serial.as_str(), &flags, &mut seen_values);
+            }
+        }
+        "monitor_serial_has_displays" => {
+            let (serial, connected_only) = parse_monitor_serial_args(&mut args)?;
+            let has_match = monitor_serial_has_displays(&sections, &serial, connected_only);
+            println!("{has_match}");
+        }
+        "monitor_serial_get_displays" => {
+            let (serial, connected_only) = parse_monitor_serial_args(&mut args)?;
+            let displays = monitor_serial_get_displays(&sections, &serial, connected_only);
+            for display in displays {
+                println!("{display}");
             }
         }
         "display_names" => {
@@ -399,6 +405,28 @@ fn parse_display_names_flags(args: &mut impl Iterator<Item = String>) -> Result<
     Ok(connected_only)
 }
 
+fn parse_monitor_serial_args(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(String, bool), String> {
+    let mut serial: Option<String> = None;
+    let mut connected_only = false;
+
+    for arg in args {
+        if arg == "--connected" {
+            connected_only = true;
+            continue;
+        }
+        if serial.is_none() {
+            serial = Some(arg);
+        } else {
+            return Err(format!("unexpected argument: {arg}"));
+        }
+    }
+
+    let serial = serial.ok_or_else(|| "missing argument: serial".to_string())?;
+    Ok((serial, connected_only))
+}
+
 fn parse_map_flags<I>(
     args: &mut std::iter::Peekable<I>,
     _allow_transposed: bool,
@@ -668,6 +696,82 @@ fn insert_monitor_line(map: &mut HashMap<String, String>, line: &str) {
     }
 }
 
+fn section_serial(section: &DisplaySection) -> Option<String> {
+    let edid = extract_edid_hex(section)?;
+    let decoded = decode_edid(&edid).ok()?;
+    find_serial_slice(&decoded).map(|value| value.to_string())
+}
+
+fn section_serial_matches(section: &DisplaySection, serial: &str) -> bool {
+    let edid = match extract_edid_hex(section) {
+        Some(value) => value,
+        None => return false,
+    };
+    let decoded = match decode_edid(&edid) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    find_serial_slice(&decoded).map_or(false, |value| value == serial)
+}
+
+fn find_serial_slice<'a>(decoded: &'a str) -> Option<&'a str> {
+    find_between_quotes(decoded, "Display Product Serial Number:")
+        .or_else(|| find_after_colon(decoded, "Serial Number:"))
+        .or_else(|| find_between_quotes(decoded, "Alphanumeric Data String:"))
+}
+
+fn find_between_quotes<'a>(decoded: &'a str, label: &str) -> Option<&'a str> {
+    for line in decoded.lines() {
+        if let Some(value) = extract_between_quotes(line, label) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn find_after_colon<'a>(decoded: &'a str, label: &str) -> Option<&'a str> {
+    for line in decoded.lines() {
+        if let Some(value) = extract_after_colon(line, label) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn monitor_serial_has_displays(
+    sections: &[DisplaySection],
+    serial: &str,
+    connected_only: bool,
+) -> bool {
+    sections.iter().any(|section| {
+        if connected_only && section.state != DisplayState::Connected {
+            return false;
+        }
+        section_serial_matches(section, serial)
+    })
+}
+
+fn monitor_serial_get_displays(
+    sections: &[DisplaySection],
+    serial: &str,
+    connected_only: bool,
+) -> Vec<String> {
+    let mut matches = Vec::new();
+    for section in sections {
+        if connected_only && section.state != DisplayState::Connected {
+            continue;
+        }
+        if section_serial_matches(section, serial) {
+            matches.push(section.name.clone());
+        }
+    }
+    matches
+}
+
 fn decode_edid(hex: &str) -> Result<String, String> {
     let bytes = hex_to_bytes(hex)?;
     let mut child = Command::new("edid-decode")
@@ -724,49 +828,24 @@ fn hex_pair_to_byte(hi: char, lo: char) -> Option<u8> {
 }
 
 fn extract_serial(decoded: &str) -> Option<String> {
-    for line in decoded.lines() {
-        if let Some(value) = extract_between_quotes(line, "Display Product Serial Number:") {
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-    }
-
-    for line in decoded.lines() {
-        if let Some(value) = extract_after_colon(line, "Serial Number:") {
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-    }
-
-    for line in decoded.lines() {
-        if let Some(value) = extract_between_quotes(line, "Alphanumeric Data String:") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-
-    None
+    find_serial_slice(decoded).map(|value| value.to_string())
 }
 
-fn extract_between_quotes(line: &str, label: &str) -> Option<String> {
+fn extract_between_quotes<'a>(line: &'a str, label: &str) -> Option<&'a str> {
     if !line.contains(label) {
         return None;
     }
     let start = line.find('\'')?;
     let end = line[start + 1..].find('\'')?;
-    Some(line[start + 1..start + 1 + end].trim().to_string())
+    Some(line[start + 1..start + 1 + end].trim())
 }
 
-fn extract_after_colon(line: &str, label: &str) -> Option<String> {
+fn extract_after_colon<'a>(line: &'a str, label: &str) -> Option<&'a str> {
     if !line.contains(label) {
         return None;
     }
     let idx = line.find(':')?;
-    Some(line[idx + 1..].trim().to_string())
+    Some(line[idx + 1..].trim())
 }
 
 fn print_usage() {
@@ -781,6 +860,8 @@ display_edid <display>\n  \
 display_edid_decoded <display>\n  \
 display_serial <display>\n  \
 display_serial_map [--filtered] [--keys] [--values]\n  \
+monitor_serial_has_displays <serial> [--connected]\n  \
+monitor_serial_get_displays <serial> [--connected]\n  \
 display_connector <display>\n  \
 display_connector_map [--filtered] [--keys] [--values]\n  \
 display_monitor <display>\n  \
